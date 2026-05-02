@@ -90,7 +90,7 @@ The log includes:
 
 ## Planned Generation
 
-Normal generation samples the next token directly. Planned generation samples several candidate action chunks, predicts the future latent for each candidate, scores candidates by LM confidence plus latent novelty, and appends the best candidate.
+Normal generation samples the next token directly. Planned generation samples several candidate action chunks, predicts the future latent for each candidate, scores candidates by average continuation NLL, moderate latent novelty, and a text degeneracy penalty, then appends the best candidate.
 
 This tests whether the learned consequence model is useful at generation time, not just as an auxiliary training chart.
 

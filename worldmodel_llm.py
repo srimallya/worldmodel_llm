@@ -131,7 +131,8 @@ config = dict(
     planned_candidates=8,
     planned_temperature=0.9,
     planned_top_k=80,
-    planned_diversity_bonus=0.05,
+    planned_diversity_bonus=0.10,
+    planned_degeneracy_penalty_weight=0.75,
 
     seed=1337,
 )
@@ -921,6 +922,78 @@ def visible_prefix_action(tokens):
     return visible
 
 
+def text_degeneracy_penalty(token_ids):
+    """
+    Penalizes visibly ugly action chunks before the planner commits to them.
+    """
+
+    s = decode(token_ids.tolist())
+
+    if len(s) == 0:
+        return 1.0
+
+    penalty = 0.0
+
+    repeats = 0
+    for i in range(1, len(s)):
+        if s[i] == s[i - 1]:
+            repeats += 1
+    penalty += repeats / max(1, len(s))
+
+    space_ratio = s.count(" ") / max(1, len(s))
+    if space_ratio > 0.25:
+        penalty += (space_ratio - 0.25) * 2.0
+
+    upper_ratio = sum(c.isupper() for c in s) / max(1, len(s))
+    if upper_ratio > 0.20:
+        penalty += (upper_ratio - 0.20) * 2.0
+
+    alpha_ratio = sum(c.isalpha() for c in s) / max(1, len(s))
+    if alpha_ratio < 0.55:
+        penalty += (0.55 - alpha_ratio) * 2.0
+
+    return penalty
+
+
+@torch.no_grad()
+def continuation_nll(model, full_ids, prefix_len):
+    """
+    Average NLL of generated continuation tokens that are visible in the
+    current context window.
+
+    full_ids: [1, T]
+    prefix_len: token length before this candidate action was sampled
+    """
+
+    T = full_ids.size(1)
+
+    if T <= prefix_len:
+        return 999.0
+
+    start = max(0, T - 1 - model.block_size)
+    x = full_ids[:, start:T - 1]
+    y = full_ids[:, start + 1:T]
+
+    if x.numel() == 0 or y.numel() == 0:
+        return 999.0
+
+    logits, _, _ = model(x, targets=None)
+    logp = F.log_softmax(logits, dim=-1)
+
+    first_y_global_pos = start + 1
+    cont_start = max(0, prefix_len - first_y_global_pos)
+
+    cont_logp = logp[:, cont_start:, :].gather(
+        -1,
+        y[:, cont_start:].unsqueeze(-1),
+    ).squeeze(-1)
+
+    if cont_logp.numel() == 0:
+        return 999.0
+
+    return float((-cont_logp.mean()).detach().cpu())
+
+
 @torch.no_grad()
 def planned_generate(
     model,
@@ -931,6 +1004,7 @@ def planned_generate(
     temperature=0.9,
     top_k_val=80,
     diversity_bonus=0.05,
+    degeneracy_penalty_weight=0.75,
 ):
     model.eval()
 
@@ -946,6 +1020,7 @@ def planned_generate(
         candidate_infos = []
 
         for _ in range(candidates):
+            prefix_len = idx.size(1)
             cand = model.generate(
                 idx.clone(),
                 max_new_tokens=step_tokens,
@@ -957,15 +1032,15 @@ def planned_generate(
             z_pred = model.predict_future_latents(visible)
             z_final = z_pred[:, -1, :]
 
-            logits, _, _ = model(cand[:, -model.block_size:], targets=None)
-            last_logits = logits[:, -1, :]
-            probs = F.softmax(last_logits / max(temperature, 1e-6), dim=-1)
-            entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1).mean()
+            action_segment = cand[0, prefix_len:]
+            deg_penalty = text_degeneracy_penalty(action_segment)
+            nll = continuation_nll(model, cand, prefix_len)
 
             candidate_infos.append({
                 "cand": cand,
                 "z": z_final.squeeze(0),
-                "entropy": float(entropy.detach().cpu()),
+                "nll": nll,
+                "deg_penalty": deg_penalty,
             })
 
         Z = torch.stack([x["z"] for x in candidate_infos], dim=0)
@@ -982,7 +1057,11 @@ def planned_generate(
             else:
                 novelty = 0.0
 
-            score = -info["entropy"] + diversity_bonus * novelty
+            score = (
+                -info["nll"]
+                + diversity_bonus * novelty
+                - degeneracy_penalty_weight * info["deg_penalty"]
+            )
             scores.append(score)
 
         best_i = max(range(len(scores)), key=lambda i: scores[i])
@@ -1446,6 +1525,8 @@ print(f"checkpoint_dir: {config['checkpoint_dir']}")
 print(f"planned_generation_prefix: {config['planned_generation_prefix']!r}")
 print(f"planned_candidates: {config['planned_candidates']}")
 print(f"planned_action_tokens: {config['planned_action_tokens']}")
+print(f"planned_diversity_bonus: {config['planned_diversity_bonus']}")
+print(f"planned_degeneracy_penalty_weight: {config['planned_degeneracy_penalty_weight']}")
 print("mode: latent text world model")
 print("teacher: sees prefix + action + future, provides delta future targets")
 print("student: sees prefix + action, predicts future consequence deltas")
@@ -1529,6 +1610,7 @@ for step in range(1, config["max_steps"] + 1):
             temperature=config["planned_temperature"],
             top_k_val=config["planned_top_k"],
             diversity_bonus=config["planned_diversity_bonus"],
+            degeneracy_penalty_weight=config["planned_degeneracy_penalty_weight"],
         ))
         print("--------------------------\n")
 
