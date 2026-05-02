@@ -31,6 +31,9 @@
 import os
 import math
 import copy
+import sys
+import platform
+from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -113,6 +116,9 @@ config = dict(
     best_lm_checkpoint_name="best_lm.pt",
     best_world_checkpoint_name="best_world.pt",
 
+    # run documentation
+    training_log_dir="training_logs",
+
     # planning probe
     planning_prefix_chars=160,
     planning_candidates=6,
@@ -132,6 +138,72 @@ config = dict(
 
 
 torch.manual_seed(config["seed"])
+
+
+# ============================
+# Run documentation
+# ============================
+
+run_started_at = datetime.now().astimezone()
+run_id = run_started_at.strftime("%Y%m%d_%H%M%S")
+training_log_path = os.path.join(
+    config["training_log_dir"],
+    f"training_log_{run_id}.md",
+)
+
+
+class Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+def setup_training_log():
+    os.makedirs(config["training_log_dir"], exist_ok=True)
+
+    log_file = open(training_log_path, "w", encoding="utf-8")
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+
+    sys.stdout = Tee(original_stdout, log_file)
+    sys.stderr = Tee(original_stderr, log_file)
+
+    print("# Latent Text World Model Training Log")
+    print("")
+    print("## Run")
+    print("")
+    print(f"- run_id: `{run_id}`")
+    print(f"- started_at: `{run_started_at.isoformat()}`")
+    print(f"- working_directory: `{os.getcwd()}`")
+    print(f"- python: `{platform.python_version()}`")
+    print(f"- platform: `{platform.platform()}`")
+    print(f"- torch: `{torch.__version__}`")
+    print("")
+    print("## Hyperparameters")
+    print("")
+    print("| key | value |")
+    print("|-----|-------|")
+
+    for key in sorted(config):
+        print(f"| `{key}` | `{repr(config[key])}` |")
+
+    print("")
+    print("## Console Log")
+    print("")
+    print("```text")
+
+    return log_file, original_stdout, original_stderr
+
+
+training_log_file, original_stdout, original_stderr = setup_training_log()
 
 
 # ============================
@@ -1264,6 +1336,8 @@ def save_checkpoint(path, student, teacher, optimizer, step, lm_stats, world_sta
             "lm_stats": lm_stats,
             "world_stats": world_stats,
             "world_score": score,
+            "run_id": run_id,
+            "training_log_path": training_log_path,
         },
         path,
     )
@@ -1475,3 +1549,8 @@ print(
     f"| {best_world['step']} "
     f"| {os.path.join(config['checkpoint_dir'], config['best_world_checkpoint_name'])}"
 )
+print(f"\ntraining_log | {training_log_path}")
+print("```")
+sys.stdout = original_stdout
+sys.stderr = original_stderr
+training_log_file.close()

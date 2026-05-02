@@ -4,5 +4,6 @@ __pycache__/
 checkpoints/
 *.pt
 *.pth
+training_logs/
 
 .DS_Store
