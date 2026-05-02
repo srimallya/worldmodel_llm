@@ -23,8 +23,10 @@ The goal is not only to improve next-character loss, but to learn a latent conse
 - contrastive future loss
 - VICReg-style variance and covariance regularization
 - same-prefix counterfactual action diversity
+- same-prefix true-action classification against fake actions
 - candidate-action planning probes
 - planned generation using predicted future latents
+- top/bottom candidate action ranking diagnostics
 - best-LM and best-world checkpointing
 - timestamped Markdown training logs with hyperparameters
 
@@ -66,6 +68,7 @@ world_score = (
     + 0.10 * val_var
     + 0.01 * val_cov
     + 0.50 * val_cf_div
+    + 0.25 * val_action_ce
 )
 ```
 
@@ -93,6 +96,14 @@ The log includes:
 Normal generation samples the next token directly. Planned generation samples several candidate action chunks, predicts the future latent for each candidate, scores candidates by average continuation NLL, moderate latent novelty, and a text degeneracy penalty, then appends the best candidate.
 
 This tests whether the learned consequence model is useful at generation time, not just as an auxiliary training chart.
+
+The script also prints a ranked candidate-action diagnostic: sample many actions from the same prefix, rank them with the planner score, then show the top and bottom candidates. This is a more direct check of whether the planner score is meaningful than one long generated sample.
+
+## Action Contrast
+
+The world objective includes a same-prefix action classifier. Each counterfactual group uses the true corpus action as candidate `0` and random negative actions as candidates `1..K-1`. The model predicts future latents for every candidate action and an `action_scorer` learns to identify the true action with cross-entropy.
+
+This pushes the latent transition model toward action-conditioned branching, not only generic future-manifold matching.
 
 ## License
 

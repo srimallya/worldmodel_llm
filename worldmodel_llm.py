@@ -98,6 +98,7 @@ config = dict(
     counterfactual_diversity_weight=0.02,
     counterfactual_group_size=4,
     counterfactual_margin=0.80,
+    action_ce_weight=0.05,
 
     # warmup/ramp
     jepa_warmup_steps=1500,
@@ -133,6 +134,10 @@ config = dict(
     planned_top_k=80,
     planned_diversity_bonus=0.10,
     planned_degeneracy_penalty_weight=0.75,
+
+    # candidate ranking diagnostic
+    rank_action_tokens=64,
+    rank_candidates=16,
 
     seed=1337,
 )
@@ -518,6 +523,27 @@ def contrastive_future_loss(z_pred, z_teacher, temperature=0.1):
     return total / H
 
 
+def action_classification_loss(model, z_pred, group_size):
+    """
+    Same-prefix counterfactual action classification.
+
+    Candidate 0 in each group is the true corpus action. Candidates 1..K-1
+    are random negative actions sampled for the same prefix.
+    """
+
+    zf = z_pred[:, -1, :]
+    num_groups = zf.size(0) // group_size
+
+    if num_groups == 0 or group_size <= 1:
+        return torch.tensor(0.0, device=zf.device)
+
+    zf = zf[:num_groups * group_size]
+    scores = model.action_scorer(zf).view(num_groups, group_size)
+    labels = torch.zeros(num_groups, dtype=torch.long, device=zf.device)
+
+    return F.cross_entropy(scores, labels)
+
+
 def teacher_delta_future_latents(teacher, teacher_visible):
     teacher_hidden = teacher.encode_hidden(teacher_visible)
 
@@ -665,6 +691,12 @@ class LatentTextWorldModel(nn.Module):
             nn.Linear(config["latent_dim"], config["predictor_hidden"]),
             nn.GELU(),
             nn.Linear(config["predictor_hidden"], config["latent_dim"]),
+        )
+
+        self.action_scorer = nn.Sequential(
+            nn.Linear(config["latent_dim"], config["projector_hidden"]),
+            nn.GELU(),
+            nn.Linear(config["projector_hidden"], 1),
         )
 
         self.apply(self._init_weights)
@@ -836,6 +868,7 @@ def estimate_world_loss(student, teacher):
         nce_losses = []
         div_losses = []
         cf_div_losses = []
+        action_ce_losses = []
 
         for _ in range(10):
             batch = get_world_batch(split)
@@ -862,6 +895,11 @@ def estimate_world_loss(student, teacher):
                 group_size=config["counterfactual_group_size"],
                 margin=config["counterfactual_margin"],
             )
+            action_ce = action_classification_loss(
+                student,
+                cf_pred,
+                group_size=config["counterfactual_group_size"],
+            )
 
             B, H, D = z_pred.shape
             z_flat = z_pred.reshape(B * H, D)
@@ -875,6 +913,7 @@ def estimate_world_loss(student, teacher):
             nce_losses.append(nce.item())
             div_losses.append(div.item())
             cf_div_losses.append(cf_div.item())
+            action_ce_losses.append(action_ce.item())
 
         out[split] = {
             "jepa": sum(jepa_losses) / len(jepa_losses),
@@ -883,6 +922,7 @@ def estimate_world_loss(student, teacher):
             "nce": sum(nce_losses) / len(nce_losses),
             "div": sum(div_losses) / len(div_losses),
             "cf_div": sum(cf_div_losses) / len(cf_div_losses),
+            "action_ce": sum(action_ce_losses) / len(action_ce_losses),
         }
 
     student.train()
@@ -1118,6 +1158,11 @@ def train_step(student, teacher, optimizer, step):
         group_size=config["counterfactual_group_size"],
         margin=config["counterfactual_margin"],
     )
+    action_ce_loss = action_classification_loss(
+        student,
+        cf_pred,
+        group_size=config["counterfactual_group_size"],
+    )
 
     # ----------------------------
     # 5. Anti-collapse latent regularization
@@ -1175,6 +1220,13 @@ def train_step(student, teacher, optimizer, step):
         max_value=config["counterfactual_diversity_weight"],
     )
 
+    action_ce_w = schedule_value(
+        step=step,
+        warmup_steps=config["jepa_warmup_steps"],
+        ramp_steps=config["jepa_ramp_steps"],
+        max_value=config["action_ce_weight"],
+    )
+
     # ----------------------------
     # 7. Total loss
     # ----------------------------
@@ -1187,6 +1239,7 @@ def train_step(student, teacher, optimizer, step):
         + nce_w * nce_loss
         + div_w * d_loss
         + cf_div_w * cf_d_loss
+        + action_ce_w * action_ce_loss
     )
 
     optimizer.zero_grad(set_to_none=True)
@@ -1216,12 +1269,14 @@ def train_step(student, teacher, optimizer, step):
         "nce": float(nce_loss.detach().cpu()),
         "div": float(d_loss.detach().cpu()),
         "cf_div": float(cf_d_loss.detach().cpu()),
+        "action_ce": float(action_ce_loss.detach().cpu()),
         "jepa_w": float(jepa_w),
         "var_w": float(var_w),
         "cov_w": float(cov_w),
         "nce_w": float(nce_w),
         "div_w": float(div_w),
         "cf_div_w": float(cf_div_w),
+        "action_ce_w": float(action_ce_w),
         "grad": float(grad_norm.detach().cpu()),
         "z_norm": stats["z_norm"],
         "z_std": stats["z_std"],
@@ -1381,6 +1436,99 @@ def planning_probe_summary(model, num_prefixes=8):
     model.train()
 
 
+@torch.no_grad()
+def rank_candidate_actions(
+    model,
+    prefix,
+    action_tokens=64,
+    candidates=16,
+    temperature=0.8,
+    top_k_val=80,
+):
+    model.eval()
+
+    idx = encode(prefix).unsqueeze(0).to(device)
+
+    if idx.numel() == 0:
+        idx = torch.randint(0, vocab_size, (1, 1), device=device)
+
+    rows = []
+    cand_latents = []
+
+    for _ in range(candidates):
+        cand = model.generate(
+            idx.clone(),
+            max_new_tokens=action_tokens,
+            temperature=temperature,
+            top_k_val=top_k_val,
+        )
+
+        action = cand[0, idx.size(1):]
+        action_text = decode(action.tolist())
+        visible = visible_prefix_action(cand)
+        z_pred = model.predict_future_latents(visible)[:, -1, :]
+        nll = continuation_nll(model, cand, idx.size(1))
+        deg = text_degeneracy_penalty(action)
+
+        cand_latents.append(z_pred.squeeze(0))
+        rows.append({
+            "text": action_text,
+            "nll": nll,
+            "deg": deg,
+        })
+
+    if len(cand_latents) > 1:
+        Z = torch.stack(cand_latents, dim=0)
+        Z_n = F.normalize(Z, dim=-1)
+        S = Z_n @ Z_n.T
+
+        for i in range(candidates):
+            others = torch.cat([S[i, :i], S[i, i + 1:]], dim=0)
+            novelty = float((1.0 - others.mean()).detach().cpu())
+            rows[i]["novelty"] = novelty
+            rows[i]["score"] = (
+                -1.00 * rows[i]["nll"]
+                + config["planned_diversity_bonus"] * novelty
+                - config["planned_degeneracy_penalty_weight"] * rows[i]["deg"]
+            )
+    else:
+        rows[0]["novelty"] = 0.0
+        rows[0]["score"] = -rows[0]["nll"] - config["planned_degeneracy_penalty_weight"] * rows[0]["deg"]
+
+    rows = sorted(rows, key=lambda r: r["score"], reverse=True)
+
+    print("\n----- ranked candidate actions -----")
+    print("prefix:")
+    print(prefix[-500:])
+    print("")
+    print("TOP")
+
+    for r in rows[:3]:
+        print(
+            f"score={r['score']:.3f} "
+            f"nll={r['nll']:.3f} "
+            f"novelty={r['novelty']:.3f} "
+            f"deg={r['deg']:.3f}"
+        )
+        print(r["text"].replace("\n", "\\n")[:500])
+        print("")
+
+    print("BOTTOM")
+
+    for r in rows[-3:]:
+        print(
+            f"score={r['score']:.3f} "
+            f"nll={r['nll']:.3f} "
+            f"novelty={r['novelty']:.3f} "
+            f"deg={r['deg']:.3f}"
+        )
+        print(r["text"].replace("\n", "\\n")[:500])
+        print("")
+
+    print("------------------------------------\n")
+    model.train()
+
+
 # ============================
 # Checkpointing
 # ============================
@@ -1394,6 +1542,7 @@ def world_score(world_stats):
         + 0.10 * val["var"]
         + 0.01 * val["cov"]
         + 0.50 * val["cf_div"]
+        + 0.25 * val["action_ce"]
     )
 
 
@@ -1437,12 +1586,14 @@ def print_train_log(step, log):
         f"nce={log['nce']:.4f} "
         f"div={log['div']:.4f} "
         f"cf_div={log['cf_div']:.4f} "
+        f"action_ce={log['action_ce']:.4f} "
         f"jw={log['jepa_w']:.3f} "
         f"vw={log['var_w']:.3f} "
         f"cw={log['cov_w']:.4f} "
         f"nw={log['nce_w']:.3f} "
         f"dw={log['div_w']:.3f} "
         f"cfw={log['cf_div_w']:.3f} "
+        f"acew={log['action_ce_w']:.3f} "
         f"z_norm={log['z_norm']:.3f} "
         f"z_std={log['z_std']:.3f} "
         f"grad={log['grad']:.2f}"
@@ -1461,15 +1612,16 @@ def print_eval(step, lm_stats, world_stats, best_lm, best_world, current_world_s
     print("")
 
     print("World-model loss")
-    print("split | jepa   | var    | cov    | nce    | div    | cf_div")
-    print("------|--------|--------|--------|--------|--------|--------")
+    print("split | jepa   | var    | cov    | nce    | div    | cf_div | action_ce")
+    print("------|--------|--------|--------|--------|--------|--------|----------")
     print(
         f"train | {world_stats['train']['jepa']:.4f} "
         f"| {world_stats['train']['var']:.4f} "
         f"| {world_stats['train']['cov']:.4f} "
         f"| {world_stats['train']['nce']:.4f} "
         f"| {world_stats['train']['div']:.4f} "
-        f"| {world_stats['train']['cf_div']:.4f}"
+        f"| {world_stats['train']['cf_div']:.4f} "
+        f"| {world_stats['train']['action_ce']:.4f}"
     )
     print(
         f"val   | {world_stats['val']['jepa']:.4f} "
@@ -1477,7 +1629,8 @@ def print_eval(step, lm_stats, world_stats, best_lm, best_world, current_world_s
         f"| {world_stats['val']['cov']:.4f} "
         f"| {world_stats['val']['nce']:.4f} "
         f"| {world_stats['val']['div']:.4f} "
-        f"| {world_stats['val']['cf_div']:.4f}"
+        f"| {world_stats['val']['cf_div']:.4f} "
+        f"| {world_stats['val']['action_ce']:.4f}"
     )
     print(
         f"world_score | current={current_world_score:.4f} "
@@ -1519,6 +1672,7 @@ print(f"diversity_weight: {config['diversity_weight']}")
 print(f"counterfactual_diversity_weight: {config['counterfactual_diversity_weight']}")
 print(f"counterfactual_group_size: {config['counterfactual_group_size']}")
 print(f"counterfactual_margin: {config['counterfactual_margin']}")
+print(f"action_ce_weight: {config['action_ce_weight']}")
 print(f"jepa_warmup_steps: {config['jepa_warmup_steps']}")
 print(f"jepa_ramp_steps: {config['jepa_ramp_steps']}")
 print(f"checkpoint_dir: {config['checkpoint_dir']}")
@@ -1527,6 +1681,8 @@ print(f"planned_candidates: {config['planned_candidates']}")
 print(f"planned_action_tokens: {config['planned_action_tokens']}")
 print(f"planned_diversity_bonus: {config['planned_diversity_bonus']}")
 print(f"planned_degeneracy_penalty_weight: {config['planned_degeneracy_penalty_weight']}")
+print(f"rank_candidates: {config['rank_candidates']}")
+print(f"rank_action_tokens: {config['rank_action_tokens']}")
 print("mode: latent text world model")
 print("teacher: sees prefix + action + future, provides delta future targets")
 print("student: sees prefix + action, predicts future consequence deltas")
@@ -1616,6 +1772,14 @@ for step in range(1, config["max_steps"] + 1):
 
         planning_probe(student)
         planning_probe_summary(student, num_prefixes=8)
+        rank_candidate_actions(
+            student,
+            prefix=config["planned_generation_prefix"],
+            action_tokens=config["rank_action_tokens"],
+            candidates=config["rank_candidates"],
+            temperature=config["planned_temperature"],
+            top_k_val=config["planned_top_k"],
+        )
 
 
 print("\n===== best checkpoint =====")
