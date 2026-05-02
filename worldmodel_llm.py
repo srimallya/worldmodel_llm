@@ -99,6 +99,9 @@ config = dict(
     counterfactual_group_size=4,
     counterfactual_margin=0.80,
     action_ce_weight=0.05,
+    counterfactual_negative_mode="random",
+    model_negative_temperature=0.9,
+    model_negative_top_k=80,
 
     # warmup/ramp
     jepa_warmup_steps=1500,
@@ -134,6 +137,7 @@ config = dict(
     planned_top_k=80,
     planned_diversity_bonus=0.10,
     planned_degeneracy_penalty_weight=0.75,
+    planned_horizon_instability_weight=0.25,
 
     # candidate ranking diagnostic
     rank_action_tokens=64,
@@ -324,16 +328,20 @@ def get_world_batch(split):
     }
 
 
-def get_counterfactual_action_batch(split):
+def get_counterfactual_action_batch(split, model=None):
     src = train_data if split == "train" else val_data
 
     prefix_len = config["prefix_len"]
     action_len = config["action_len"]
     group_size = config["counterfactual_group_size"]
     total = prefix_len + action_len + 1
+    negative_mode = config["counterfactual_negative_mode"]
 
     if group_size < 2:
         raise ValueError("counterfactual_group_size must be at least 2.")
+
+    if negative_mode not in ("random", "model"):
+        raise ValueError("counterfactual_negative_mode must be 'random' or 'model'.")
 
     if len(src) <= total:
         raise ValueError(
@@ -349,8 +357,28 @@ def get_counterfactual_action_batch(split):
         prefix = src[i:i + prefix_len]
         true_action = src[i + prefix_len:i + prefix_len + action_len]
 
-        neg_ix = torch.randint(0, len(src) - action_len - 1, (group_size - 1,))
-        neg_actions = [src[j:j + action_len] for j in neg_ix]
+        if negative_mode == "model" and model is not None:
+            was_training = model.training
+            model.eval()
+            neg_actions = []
+
+            with torch.no_grad():
+                prefix_device = prefix.unsqueeze(0).to(device)
+
+                for _ in range(group_size - 1):
+                    generated = model.generate(
+                        prefix_device.clone(),
+                        max_new_tokens=action_len,
+                        temperature=config["model_negative_temperature"],
+                        top_k_val=config["model_negative_top_k"],
+                    )
+                    neg_actions.append(generated[0, prefix_len:].detach().cpu())
+
+            if was_training:
+                model.train()
+        else:
+            neg_ix = torch.randint(0, len(src) - action_len - 1, (group_size - 1,))
+            neg_actions = [src[j:j + action_len] for j in neg_ix]
 
         all_actions = [true_action] + neg_actions
 
@@ -680,6 +708,12 @@ class LatentTextWorldModel(nn.Module):
             nn.Linear(config["projector_hidden"], config["latent_dim"]),
         )
 
+        self.state_action_projector = nn.Sequential(
+            nn.Linear(3 * n_embd, config["projector_hidden"]),
+            nn.GELU(),
+            nn.Linear(config["projector_hidden"], config["latent_dim"]),
+        )
+
         # One predictor shared across horizons.
         # Horizon identity is injected with a learned embedding.
         self.horizon_embed = nn.Embedding(
@@ -765,8 +799,19 @@ class LatentTextWorldModel(nn.Module):
 
         hidden = self.encode_hidden(student_visible)
 
-        pooled = hidden.mean(dim=1)
-        z_context = self.projector(pooled)
+        prefix_end = min(config["prefix_len"], hidden.size(1))
+
+        prefix_pool = hidden[:, :prefix_end, :].mean(dim=1)
+
+        if prefix_end < hidden.size(1):
+            action_pool = hidden[:, prefix_end:, :].mean(dim=1)
+        else:
+            action_pool = hidden[:, -1:, :].mean(dim=1)
+
+        boundary_state = hidden[:, -1, :]
+
+        pooled = torch.cat([prefix_pool, action_pool, boundary_state], dim=-1)
+        z_context = self.state_action_projector(pooled)
 
         preds = []
 
@@ -888,7 +933,7 @@ def estimate_world_loss(student, teacher):
             )
             div = diversity_loss(z_pred)
 
-            cf_visible = get_counterfactual_action_batch(split)
+            cf_visible = get_counterfactual_action_batch(split, model=student)
             cf_pred = student.predict_future_latents(cf_visible)
             cf_div = grouped_action_diversity_loss(
                 cf_pred,
@@ -995,6 +1040,17 @@ def text_degeneracy_penalty(token_ids):
     return penalty
 
 
+def horizon_shift_distance(z_pred):
+    if z_pred.size(1) <= 1:
+        return 0.0
+
+    z_normed = F.normalize(z_pred, dim=-1)
+    adjacent_cos = (z_normed[:, :-1, :] * z_normed[:, 1:, :]).sum(dim=-1)
+    shift = 1.0 - adjacent_cos
+
+    return float(shift.mean().detach().cpu())
+
+
 @torch.no_grad()
 def continuation_nll(model, full_ids, prefix_len):
     """
@@ -1045,6 +1101,7 @@ def planned_generate(
     top_k_val=80,
     diversity_bonus=0.05,
     degeneracy_penalty_weight=0.75,
+    horizon_instability_weight=0.25,
 ):
     model.eval()
 
@@ -1071,6 +1128,7 @@ def planned_generate(
             visible = visible_prefix_action(cand)
             z_pred = model.predict_future_latents(visible)
             z_final = z_pred[:, -1, :]
+            horizon_shift = horizon_shift_distance(z_pred)
 
             action_segment = cand[0, prefix_len:]
             deg_penalty = text_degeneracy_penalty(action_segment)
@@ -1081,6 +1139,7 @@ def planned_generate(
                 "z": z_final.squeeze(0),
                 "nll": nll,
                 "deg_penalty": deg_penalty,
+                "horizon_shift": horizon_shift,
             })
 
         Z = torch.stack([x["z"] for x in candidate_infos], dim=0)
@@ -1101,6 +1160,7 @@ def planned_generate(
                 -info["nll"]
                 + diversity_bonus * novelty
                 - degeneracy_penalty_weight * info["deg_penalty"]
+                - horizon_instability_weight * info["horizon_shift"]
             )
             scores.append(score)
 
@@ -1151,7 +1211,8 @@ def train_step(student, teacher, optimizer, step):
     )
     d_loss = diversity_loss(z_pred)
 
-    cf_visible = get_counterfactual_action_batch("train")
+    cf_visible = get_counterfactual_action_batch("train", model=student)
+    student.train()
     cf_pred = student.predict_future_latents(cf_visible)
     cf_d_loss = grouped_action_diversity_loss(
         cf_pred,
@@ -1466,15 +1527,18 @@ def rank_candidate_actions(
         action = cand[0, idx.size(1):]
         action_text = decode(action.tolist())
         visible = visible_prefix_action(cand)
-        z_pred = model.predict_future_latents(visible)[:, -1, :]
+        z_all = model.predict_future_latents(visible)
+        z_pred = z_all[:, -1, :]
         nll = continuation_nll(model, cand, idx.size(1))
         deg = text_degeneracy_penalty(action)
+        horizon_shift = horizon_shift_distance(z_all)
 
         cand_latents.append(z_pred.squeeze(0))
         rows.append({
             "text": action_text,
             "nll": nll,
             "deg": deg,
+            "horizon_shift": horizon_shift,
         })
 
     if len(cand_latents) > 1:
@@ -1490,10 +1554,15 @@ def rank_candidate_actions(
                 -1.00 * rows[i]["nll"]
                 + config["planned_diversity_bonus"] * novelty
                 - config["planned_degeneracy_penalty_weight"] * rows[i]["deg"]
+                - config["planned_horizon_instability_weight"] * rows[i]["horizon_shift"]
             )
     else:
         rows[0]["novelty"] = 0.0
-        rows[0]["score"] = -rows[0]["nll"] - config["planned_degeneracy_penalty_weight"] * rows[0]["deg"]
+        rows[0]["score"] = (
+            -rows[0]["nll"]
+            - config["planned_degeneracy_penalty_weight"] * rows[0]["deg"]
+            - config["planned_horizon_instability_weight"] * rows[0]["horizon_shift"]
+        )
 
     rows = sorted(rows, key=lambda r: r["score"], reverse=True)
 
@@ -1508,7 +1577,8 @@ def rank_candidate_actions(
             f"score={r['score']:.3f} "
             f"nll={r['nll']:.3f} "
             f"novelty={r['novelty']:.3f} "
-            f"deg={r['deg']:.3f}"
+            f"deg={r['deg']:.3f} "
+            f"hshift={r['horizon_shift']:.3f}"
         )
         print(r["text"].replace("\n", "\\n")[:500])
         print("")
@@ -1520,13 +1590,127 @@ def rank_candidate_actions(
             f"score={r['score']:.3f} "
             f"nll={r['nll']:.3f} "
             f"novelty={r['novelty']:.3f} "
-            f"deg={r['deg']:.3f}"
+            f"deg={r['deg']:.3f} "
+            f"hshift={r['horizon_shift']:.3f}"
         )
         print(r["text"].replace("\n", "\\n")[:500])
         print("")
 
     print("------------------------------------\n")
     model.train()
+
+
+def pairwise_cosine_stats(z):
+    if z.size(0) <= 1:
+        return {
+            "cos_mean": 1.0,
+            "cos_min": 1.0,
+            "cos_max": 1.0,
+            "dist_mean": 0.0,
+        }
+
+    z_n = F.normalize(z, dim=-1)
+    sim = z_n @ z_n.T
+    mask = ~torch.eye(sim.size(0), dtype=torch.bool, device=sim.device)
+    off = sim[mask]
+
+    return {
+        "cos_mean": float(off.mean().detach().cpu()),
+        "cos_min": float(off.min().detach().cpu()),
+        "cos_max": float(off.max().detach().cpu()),
+        "dist_mean": float((1.0 - off).mean().detach().cpu()),
+    }
+
+
+@torch.no_grad()
+def world_model_diagnostics(student, teacher, split="val", batches=10):
+    student_was_training = student.training
+    teacher_was_training = teacher.training
+
+    student.eval()
+    teacher.eval()
+
+    true_jepas = []
+    shuffled_jepas = []
+    action_sensitivities = []
+    context_sensitivities = []
+    cand_cos_means = []
+    cand_cos_mins = []
+    cand_cos_maxs = []
+
+    for _ in range(max(1, batches)):
+        batch = get_world_batch(split)
+        z_pred = student.predict_future_latents(batch["student_visible"])
+        z_teacher = teacher_delta_future_latents(teacher, batch["teacher_visible"])
+
+        true_jepas.append(jepa_prediction_loss(z_pred, z_teacher).item())
+
+        if z_teacher.size(0) > 1:
+            shuffle_ix = torch.randperm(z_teacher.size(0), device=z_teacher.device)
+            shuffled_teacher = z_teacher[shuffle_ix]
+        else:
+            shuffled_teacher = z_teacher
+
+        shuffled_jepas.append(jepa_prediction_loss(z_pred, shuffled_teacher).item())
+
+        prefix = batch["prefix"][:1]
+        action_latents = []
+
+        for _ in range(max(2, config["planning_candidates"])):
+            generated = student.generate(
+                prefix.clone(),
+                max_new_tokens=config["action_len"],
+                temperature=config["model_negative_temperature"],
+                top_k_val=config["model_negative_top_k"],
+            )
+            visible = visible_prefix_action(generated)
+            z_action = student.predict_future_latents(visible)[:, -1, :]
+            action_latents.append(z_action.squeeze(0))
+
+        action_stats = pairwise_cosine_stats(torch.stack(action_latents, dim=0))
+        action_sensitivities.append(action_stats["dist_mean"])
+
+        shared_action = batch["action"][:1].repeat(batch["prefix"].size(0), 1)
+        context_visible = torch.cat([batch["prefix"], shared_action], dim=1)
+        context_z = student.predict_future_latents(context_visible)[:, -1, :]
+        context_stats = pairwise_cosine_stats(context_z)
+        context_sensitivities.append(context_stats["dist_mean"])
+
+        candidate_latents = []
+
+        for _ in range(max(2, config["planning_candidates"])):
+            generated = student.generate(
+                prefix.clone(),
+                max_new_tokens=config["planning_action_tokens"],
+                temperature=config["planned_temperature"],
+                top_k_val=config["planned_top_k"],
+            )
+            visible = visible_prefix_action(generated)
+            candidate_latents.append(student.predict_future_latents(visible)[:, -1, :].squeeze(0))
+
+        candidate_stats = pairwise_cosine_stats(torch.stack(candidate_latents, dim=0))
+        cand_cos_means.append(candidate_stats["cos_mean"])
+        cand_cos_mins.append(candidate_stats["cos_min"])
+        cand_cos_maxs.append(candidate_stats["cos_max"])
+
+    if student_was_training:
+        student.train()
+    if teacher_was_training:
+        teacher.train()
+
+    true_jepa = sum(true_jepas) / len(true_jepas)
+    shuffled_future_jepa = sum(shuffled_jepas) / len(shuffled_jepas)
+
+    return {
+        "true_jepa": true_jepa,
+        "shuffled_future_jepa": shuffled_future_jepa,
+        "match_gap": shuffled_future_jepa - true_jepa,
+        "action_sensitivity": sum(action_sensitivities) / len(action_sensitivities),
+        "context_sensitivity": sum(context_sensitivities) / len(context_sensitivities),
+        "candidate_cos_mean": sum(cand_cos_means) / len(cand_cos_means),
+        "candidate_cos_min": min(cand_cos_mins),
+        "candidate_cos_max": max(cand_cos_maxs),
+    }
 
 
 # ============================
@@ -1546,7 +1730,17 @@ def world_score(world_stats):
     )
 
 
-def save_checkpoint(path, student, teacher, optimizer, step, lm_stats, world_stats, score):
+def save_checkpoint(
+    path,
+    student,
+    teacher,
+    optimizer,
+    step,
+    lm_stats,
+    world_stats,
+    score,
+    diagnostics=None,
+):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     torch.save(
@@ -1564,6 +1758,7 @@ def save_checkpoint(path, student, teacher, optimizer, step, lm_stats, world_sta
             "lm_stats": lm_stats,
             "world_stats": world_stats,
             "world_score": score,
+            "world_diagnostics": diagnostics,
             "run_id": run_id,
             "training_log_path": training_log_path,
         },
@@ -1639,6 +1834,29 @@ def print_eval(step, lm_stats, world_stats, best_lm, best_world, current_world_s
     print("")
 
 
+def print_world_diagnostics(diagnostics):
+    print("World diagnostics")
+    print(
+        "true_jepa | shuffled_jepa | match_gap | action_sens | context_sens "
+        "| cand_cos_mean | cand_cos_min | cand_cos_max"
+    )
+    print(
+        "----------|---------------|-----------|-------------|--------------"
+        "|---------------|--------------|-------------"
+    )
+    print(
+        f"{diagnostics['true_jepa']:.4f} "
+        f"| {diagnostics['shuffled_future_jepa']:.4f} "
+        f"| {diagnostics['match_gap']:.4f} "
+        f"| {diagnostics['action_sensitivity']:.4f} "
+        f"| {diagnostics['context_sensitivity']:.4f} "
+        f"| {diagnostics['candidate_cos_mean']:.4f} "
+        f"| {diagnostics['candidate_cos_min']:.4f} "
+        f"| {diagnostics['candidate_cos_max']:.4f}"
+    )
+    print("")
+
+
 # ============================
 # Main
 # ============================
@@ -1673,6 +1891,9 @@ print(f"counterfactual_diversity_weight: {config['counterfactual_diversity_weigh
 print(f"counterfactual_group_size: {config['counterfactual_group_size']}")
 print(f"counterfactual_margin: {config['counterfactual_margin']}")
 print(f"action_ce_weight: {config['action_ce_weight']}")
+print(f"counterfactual_negative_mode: {config['counterfactual_negative_mode']}")
+print(f"model_negative_temperature: {config['model_negative_temperature']}")
+print(f"model_negative_top_k: {config['model_negative_top_k']}")
 print(f"jepa_warmup_steps: {config['jepa_warmup_steps']}")
 print(f"jepa_ramp_steps: {config['jepa_ramp_steps']}")
 print(f"checkpoint_dir: {config['checkpoint_dir']}")
@@ -1681,6 +1902,7 @@ print(f"planned_candidates: {config['planned_candidates']}")
 print(f"planned_action_tokens: {config['planned_action_tokens']}")
 print(f"planned_diversity_bonus: {config['planned_diversity_bonus']}")
 print(f"planned_degeneracy_penalty_weight: {config['planned_degeneracy_penalty_weight']}")
+print(f"planned_horizon_instability_weight: {config['planned_horizon_instability_weight']}")
 print(f"rank_candidates: {config['rank_candidates']}")
 print(f"rank_action_tokens: {config['rank_action_tokens']}")
 print("mode: latent text world model")
@@ -1709,6 +1931,7 @@ for step in range(1, config["max_steps"] + 1):
 
         lm_stats = estimate_lm_loss(student)
         world_stats = estimate_world_loss(student, teacher)
+        diagnostics = world_model_diagnostics(student, teacher, split="val", batches=10)
         current_world_score = world_score(world_stats)
 
         if lm_stats["val"] < best_lm["val_lm"]:
@@ -1726,6 +1949,7 @@ for step in range(1, config["max_steps"] + 1):
                 lm_stats=lm_stats,
                 world_stats=world_stats,
                 score=current_world_score,
+                diagnostics=diagnostics,
             )
 
         if current_world_score < best_world["score"]:
@@ -1742,9 +1966,13 @@ for step in range(1, config["max_steps"] + 1):
                 lm_stats=lm_stats,
                 world_stats=world_stats,
                 score=current_world_score,
+                diagnostics=diagnostics,
             )
 
         print_eval(step, lm_stats, world_stats, best_lm, best_world, current_world_score)
+
+        planning_probe(student)
+        planning_probe_summary(student, num_prefixes=8)
 
         print("----- sample -----")
         sample_text(student, prefix="", steps=config["sample_tokens"])
@@ -1767,11 +1995,10 @@ for step in range(1, config["max_steps"] + 1):
             top_k_val=config["planned_top_k"],
             diversity_bonus=config["planned_diversity_bonus"],
             degeneracy_penalty_weight=config["planned_degeneracy_penalty_weight"],
+            horizon_instability_weight=config["planned_horizon_instability_weight"],
         ))
         print("--------------------------\n")
 
-        planning_probe(student)
-        planning_probe_summary(student, num_prefixes=8)
         rank_candidate_actions(
             student,
             prefix=config["planned_generation_prefix"],
@@ -1780,6 +2007,7 @@ for step in range(1, config["max_steps"] + 1):
             temperature=config["planned_temperature"],
             top_k_val=config["planned_top_k"],
         )
+        print_world_diagnostics(diagnostics)
 
 
 print("\n===== best checkpoint =====")

@@ -19,11 +19,14 @@ The goal is not only to improve next-character loss, but to learn a latent conse
 - character-level causal Transformer LM
 - EMA teacher model
 - multi-horizon future latent prediction
+- explicit prefix/action/boundary state-action factorization
 - JEPA prediction loss
 - contrastive future loss
 - VICReg-style variance and covariance regularization
 - same-prefix counterfactual action diversity
 - same-prefix true-action classification against fake actions
+- optional model-sampled hard negative actions
+- true-vs-shuffled future diagnostics
 - candidate-action planning probes
 - planned generation using predicted future latents
 - top/bottom candidate action ranking diagnostics
@@ -93,7 +96,7 @@ The log includes:
 
 ## Planned Generation
 
-Normal generation samples the next token directly. Planned generation samples several candidate action chunks, predicts the future latent for each candidate, scores candidates by average continuation NLL, moderate latent novelty, and a text degeneracy penalty, then appends the best candidate.
+Normal generation samples the next token directly. Planned generation samples several candidate action chunks, predicts the future latent for each candidate, scores candidates by average continuation NLL, moderate latent novelty, a text degeneracy penalty, and predicted horizon stability, then appends the best candidate.
 
 This tests whether the learned consequence model is useful at generation time, not just as an auxiliary training chart.
 
@@ -104,6 +107,21 @@ The script also prints a ranked candidate-action diagnostic: sample many actions
 The world objective includes a same-prefix action classifier. Each counterfactual group uses the true corpus action as candidate `0` and random negative actions as candidates `1..K-1`. The model predicts future latents for every candidate action and an `action_scorer` learns to identify the true action with cross-entropy.
 
 This pushes the latent transition model toward action-conditioned branching, not only generic future-manifold matching.
+
+The default counterfactual negatives are random corpus actions. Setting `counterfactual_negative_mode="model"` uses the current model to sample plausible same-prefix negative actions instead, which is harder but slower.
+
+## World Diagnostics
+
+Each eval prints diagnostics for conditional consequence structure:
+
+- `true_jepa`: student prediction against the matching teacher future
+- `shuffled_jepa`: same student prediction against shuffled teacher futures
+- `match_gap`: shuffled minus true JEPA
+- `action_sens`: same-prefix action consequence distance
+- `context_sens`: different-prefix consequence distance under a shared action
+- `cand_cos_*`: cosine stats for planning-style candidate action latents
+
+Checkpoints include these diagnostics as metadata, but checkpoint selection still uses the existing world score.
 
 ## License
 
