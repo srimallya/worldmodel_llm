@@ -85,11 +85,11 @@ config = dict(
     token_weight=1.0,
 
     # JEPA ramps from 0 to this value
-    jepa_weight=0.50,
+    jepa_weight=0.30,
 
     # VICReg-style anti-collapse terms
-    variance_weight=0.15,
-    covariance_weight=0.005,
+    variance_weight=0.08,
+    covariance_weight=0.01,
 
     # Future discrimination terms
     contrastive_weight=0.08,
@@ -105,9 +105,15 @@ config = dict(
 
     # warmup/ramp
     jepa_warmup_steps=1500,
-    jepa_ramp_steps=5000,
+    jepa_ramp_steps=8000,
 
-    # teacher
+    # latent norm control to prevent explosion after JEPA ramp
+    max_latent_norm=10.0,
+    latent_norm_weight=0.005,
+
+    # action_ce delay: only start after match_gap > threshold or step > threshold
+    action_ce_match_gap_threshold=0.05,
+    action_ce_step_threshold=3000,
     ema_decay=0.995,
 
     # sampling
@@ -160,6 +166,8 @@ training_log_path = os.path.join(
     config["training_log_dir"],
     f"training_log_{run_id}.md",
 )
+
+action_ce_enabled = False
 
 
 class Tee:
@@ -463,6 +471,18 @@ def covariance_loss(z):
     return loss
 
 
+def latent_norm_loss(z_pred, max_norm=10.0):
+    """
+    Prevents latent norm explosion after JEPA ramp.
+    Penalizes latent norms that exceed max_norm.
+
+    z_pred: [B, H, D]
+    """
+    norms = z_pred.norm(dim=-1)
+    loss = F.relu(norms - max_norm).pow(2).mean()
+    return loss
+
+
 def jepa_prediction_loss(z_pred, z_teacher):
     """
     Directional match plus bounded raw-latent match.
@@ -481,6 +501,44 @@ def jepa_prediction_loss(z_pred, z_teacher):
     )
 
     return cos_loss + 0.25 * raw_loss
+
+
+def jepa_prediction_loss_per_horizon(z_pred, z_teacher):
+    """
+    Compute JEPA loss per horizon.
+
+    z_pred: [B, H, D]
+    z_teacher: [B, H, D]
+
+    Returns: list of losses, one per horizon
+    """
+    horizons = config["future_horizons"]
+    losses = {}
+    for h_idx, h in enumerate(horizons):
+        z_p = z_pred[:, h_idx, :]
+        z_t = z_teacher[:, h_idx, :]
+        z_p_n = F.normalize(z_p, dim=-1)
+        z_t_n = F.normalize(z_t, dim=-1)
+        cos_loss = 1.0 - (z_p_n * z_t_n).sum(dim=-1).mean()
+        raw_loss = F.smooth_l1_loss(
+            torch.tanh(z_p / 5.0),
+            torch.tanh(z_t / 5.0),
+        )
+        losses[h] = (cos_loss + 0.25 * raw_loss).item()
+    return losses
+
+
+def horizon_cosine_distances(z_pred):
+    """
+    Compute mean cosine distance between adjacent predicted horizons.
+
+    z_pred: [B, H, D]
+
+    Returns: float mean adjacent cosine distance
+    """
+    z_normed = F.normalize(z_pred, dim=-1)
+    adjacent_cos = (z_normed[:, :-1, :] * z_normed[:, 1:, :]).sum(dim=-1)
+    return float(adjacent_cos.mean().detach().cpu())
 
 
 def diversity_loss(z, margin=0.15):
@@ -1171,6 +1229,7 @@ def planned_generate(
 
 
 def train_step(student, teacher, optimizer, step):
+    global action_ce_enabled
     batch = get_world_batch("train")
 
     student_visible = batch["student_visible"]
@@ -1234,6 +1293,7 @@ def train_step(student, teacher, optimizer, step):
 
     v_loss = variance_loss(z_flat)
     c_loss = covariance_loss(z_flat)
+    ln_loss = latent_norm_loss(z_pred, max_norm=config["max_latent_norm"])
 
     # ----------------------------
     # 6. Loss schedule
@@ -1259,6 +1319,8 @@ def train_step(student, teacher, optimizer, step):
         ramp_steps=config["jepa_ramp_steps"],
         max_value=config["covariance_weight"],
     )
+
+    ln_w = config["latent_norm_weight"]
 
     nce_w = schedule_value(
         step=step,
@@ -1288,6 +1350,9 @@ def train_step(student, teacher, optimizer, step):
         max_value=config["action_ce_weight"],
     )
 
+    if not action_ce_enabled:
+        action_ce_w = 0.0
+
     # ----------------------------
     # 7. Total loss
     # ----------------------------
@@ -1297,6 +1362,7 @@ def train_step(student, teacher, optimizer, step):
         + jepa_w * jepa_loss
         + var_w * v_loss
         + cov_w * c_loss
+        + ln_w * ln_loss
         + nce_w * nce_loss
         + div_w * d_loss
         + cf_div_w * cf_d_loss
@@ -1334,6 +1400,8 @@ def train_step(student, teacher, optimizer, step):
         "jepa_w": float(jepa_w),
         "var_w": float(var_w),
         "cov_w": float(cov_w),
+        "ln": float(ln_loss.detach().cpu()),
+        "ln_w": float(ln_w),
         "nce_w": float(nce_w),
         "div_w": float(div_w),
         "cf_div_w": float(cf_div_w),
@@ -1637,6 +1705,10 @@ def world_model_diagnostics(student, teacher, split="val", batches=10):
     cand_cos_means = []
     cand_cos_mins = []
     cand_cos_maxs = []
+    horizon_cos_dists = []
+
+    per_horizon_true_jepas = {h: [] for h in config["future_horizons"]}
+    per_horizon_shuffled_jepas = {h: [] for h in config["future_horizons"]}
 
     for _ in range(max(1, batches)):
         batch = get_world_batch(split)
@@ -1645,6 +1717,10 @@ def world_model_diagnostics(student, teacher, split="val", batches=10):
 
         true_jepas.append(jepa_prediction_loss(z_pred, z_teacher).item())
 
+        true_jepa_per_h = jepa_prediction_loss_per_horizon(z_pred, z_teacher)
+        for h, loss in true_jepa_per_h.items():
+            per_horizon_true_jepas[h].append(loss)
+
         if z_teacher.size(0) > 1:
             shuffle_ix = torch.randperm(z_teacher.size(0), device=z_teacher.device)
             shuffled_teacher = z_teacher[shuffle_ix]
@@ -1652,6 +1728,10 @@ def world_model_diagnostics(student, teacher, split="val", batches=10):
             shuffled_teacher = z_teacher
 
         shuffled_jepas.append(jepa_prediction_loss(z_pred, shuffled_teacher).item())
+
+        shuffled_jepa_per_h = jepa_prediction_loss_per_horizon(z_pred, shuffled_teacher)
+        for h, loss in shuffled_jepa_per_h.items():
+            per_horizon_shuffled_jepas[h].append(loss)
 
         prefix = batch["prefix"][:1]
         action_latents = []
@@ -1693,6 +1773,8 @@ def world_model_diagnostics(student, teacher, split="val", batches=10):
         cand_cos_mins.append(candidate_stats["cos_min"])
         cand_cos_maxs.append(candidate_stats["cos_max"])
 
+        horizon_cos_dists.append(horizon_cosine_distances(z_pred))
+
     if student_was_training:
         student.train()
     if teacher_was_training:
@@ -1700,6 +1782,16 @@ def world_model_diagnostics(student, teacher, split="val", batches=10):
 
     true_jepa = sum(true_jepas) / len(true_jepas)
     shuffled_future_jepa = sum(shuffled_jepas) / len(shuffled_jepas)
+
+    per_horizon_results = {}
+    for h in config["future_horizons"]:
+        tj = sum(per_horizon_true_jepas[h]) / len(per_horizon_true_jepas[h])
+        sj = sum(per_horizon_shuffled_jepas[h]) / len(per_horizon_shuffled_jepas[h])
+        per_horizon_results[h] = {
+            "true_jepa": tj,
+            "shuffled_jepa": sj,
+            "match_gap": sj - tj,
+        }
 
     return {
         "true_jepa": true_jepa,
@@ -1710,6 +1802,8 @@ def world_model_diagnostics(student, teacher, split="val", batches=10):
         "candidate_cos_mean": sum(cand_cos_means) / len(cand_cos_means),
         "candidate_cos_min": min(cand_cos_mins),
         "candidate_cos_max": max(cand_cos_maxs),
+        "horizon_cos_dist": sum(horizon_cos_dists) / len(horizon_cos_dists),
+        "per_horizon": per_horizon_results,
     }
 
 
@@ -1771,6 +1865,7 @@ def save_checkpoint(
 # ============================
 
 def print_train_log(step, log):
+    ace_flag = "*" if log["action_ce_w"] > 0 else ""
     print(
         f"[step {step:5d}] "
         f"loss={log['loss']:.4f} "
@@ -1778,10 +1873,11 @@ def print_train_log(step, log):
         f"jepa={log['jepa']:.4f} "
         f"var={log['var']:.4f} "
         f"cov={log['cov']:.4f} "
+        f"ln={log['ln']:.4f} "
         f"nce={log['nce']:.4f} "
         f"div={log['div']:.4f} "
         f"cf_div={log['cf_div']:.4f} "
-        f"action_ce={log['action_ce']:.4f} "
+        f"action_ce={log['action_ce']:.4f}{ace_flag} "
         f"jw={log['jepa_w']:.3f} "
         f"vw={log['var_w']:.3f} "
         f"cw={log['cov_w']:.4f} "
@@ -1838,11 +1934,11 @@ def print_world_diagnostics(diagnostics):
     print("World diagnostics")
     print(
         "true_jepa | shuffled_jepa | match_gap | action_sens | context_sens "
-        "| cand_cos_mean | cand_cos_min | cand_cos_max"
+        "| cand_cos_mean | cand_cos_min | cand_cos_max | h_cos_dist"
     )
     print(
         "----------|---------------|-----------|-------------|--------------"
-        "|---------------|--------------|-------------"
+        "|---------------|--------------|-------------|------------"
     )
     print(
         f"{diagnostics['true_jepa']:.4f} "
@@ -1852,8 +1948,17 @@ def print_world_diagnostics(diagnostics):
         f"| {diagnostics['context_sensitivity']:.4f} "
         f"| {diagnostics['candidate_cos_mean']:.4f} "
         f"| {diagnostics['candidate_cos_min']:.4f} "
-        f"| {diagnostics['candidate_cos_max']:.4f}"
+        f"| {diagnostics['candidate_cos_max']:.4f} "
+        f"| {diagnostics['horizon_cos_dist']:.4f}"
     )
+    print("Per-horizon JEPA:")
+    print("horizon | true_jepa | shuffled_jepa | match_gap")
+    print("--------|-----------|---------------|----------")
+    for h in config["future_horizons"]:
+        ph = diagnostics["per_horizon"][h]
+        print(
+            f"h{h:4d}   | {ph['true_jepa']:.4f}    | {ph['shuffled_jepa']:.4f}       | {ph['match_gap']:.4f}"
+        )
     print("")
 
 
@@ -1933,6 +2038,12 @@ for step in range(1, config["max_steps"] + 1):
         world_stats = estimate_world_loss(student, teacher)
         diagnostics = world_model_diagnostics(student, teacher, split="val", batches=10)
         current_world_score = world_score(world_stats)
+
+        if (
+            step >= config["action_ce_step_threshold"]
+            or diagnostics["match_gap"] > config["action_ce_match_gap_threshold"]
+        ):
+            action_ce_enabled = True
 
         if lm_stats["val"] < best_lm["val_lm"]:
             best_lm = {
