@@ -541,6 +541,26 @@ def horizon_cosine_distances(z_pred):
     return float(adjacent_cos.mean().detach().cpu())
 
 
+def horizon_cosine_distances_per_adjacent(z_pred):
+    """
+    Compute cosine similarity and distance for each adjacent horizon pair.
+
+    z_pred: [B, H, D]
+
+    Returns: dict with cos and dist for each adjacent pair
+    """
+    horizons = config["future_horizons"]
+    z_normed = F.normalize(z_pred, dim=-1)
+    results = {}
+    for i in range(len(horizons) - 1):
+        h_curr = horizons[i]
+        h_next = horizons[i + 1]
+        cos = (z_normed[:, i, :] * z_normed[:, i + 1, :]).sum(dim=-1).mean().item()
+        results[f"cos_{h_curr}_{h_next}"] = cos
+        results[f"dist_{h_curr}_{h_next}"] = 1.0 - cos
+    return results
+
+
 def diversity_loss(z, margin=0.15):
     """
     z: [B, H, D]
@@ -1034,7 +1054,7 @@ def estimate_world_loss(student, teacher):
 
 
 @torch.no_grad()
-def sample_text(model, prefix="", steps=None):
+def sample_text(model, prefix="", steps=None, return_text=False):
     if steps is None:
         steps = config["sample_tokens"]
 
@@ -1050,7 +1070,10 @@ def sample_text(model, prefix="", steps=None):
         top_k_val=config["top_k"],
     )[0].tolist()
 
-    print(decode(out))
+    text = decode(out)
+    if return_text:
+        return text
+    print(text)
 
 
 def visible_prefix_action(tokens):
@@ -1063,6 +1086,103 @@ def visible_prefix_action(tokens):
         visible = torch.cat([pad, visible], dim=1)
 
     return visible
+
+
+def compute_generation_metrics(model, text, prefix_len=0):
+    ids = encode(text)
+    token_ids = torch.tensor(ids, device=device).unsqueeze(0)
+
+    nll = continuation_nll(model, token_ids, prefix_len) if prefix_len > 0 else 0.0
+    deg = text_degeneracy_penalty(token_ids[0])
+
+    decoded = text
+    repeats = sum(1 for i in range(1, len(decoded)) if decoded[i] == decoded[i-1])
+    repeat_rate = repeats / max(1, len(decoded))
+    unique_ratio = len(set(decoded)) / max(1, len(decoded))
+
+    return {
+        "nll": nll,
+        "deg": deg,
+        "repeat_rate": repeat_rate,
+        "unique_ratio": unique_ratio,
+    }
+
+
+def compare_normal_vs_planned(model, prefix, total_tokens=400, action_tokens=32, candidates=8):
+    model.eval()
+
+    normal_text = sample_text(model, prefix=prefix, steps=total_tokens, return_text=True)
+
+    planned_text = planned_generate(
+        model,
+        prefix=prefix,
+        total_new_tokens=total_tokens,
+        action_tokens=action_tokens,
+        candidates=candidates,
+        temperature=config["planned_temperature"],
+        top_k_val=config["planned_top_k"],
+        diversity_bonus=config["planned_diversity_bonus"],
+        degeneracy_penalty_weight=config["planned_degeneracy_penalty_weight"],
+        horizon_instability_weight=config["planned_horizon_instability_weight"],
+    )
+
+    prefix_len = len(encode(prefix))
+
+    normal_ids = encode(normal_text)
+    normal_token_ids = torch.tensor(normal_ids, device=device).unsqueeze(0)
+    normal_nll = continuation_nll(model, normal_token_ids, prefix_len)
+    normal_deg = text_degeneracy_penalty(normal_token_ids[0])
+
+    planned_ids = encode(planned_text)
+    planned_token_ids = torch.tensor(planned_ids, device=device).unsqueeze(0)
+    planned_nll = continuation_nll(model, planned_token_ids, prefix_len)
+    planned_deg = text_degeneracy_penalty(planned_token_ids[0])
+
+    def text_stats(s):
+        repeats = sum(1 for i in range(1, len(s)) if s[i] == s[i-1])
+        return {
+            "repeat_rate": repeats / max(1, len(s)),
+            "unique_ratio": len(set(s)) / max(1, len(s)),
+        }
+
+    ns = text_stats(normal_text)
+    ps = text_stats(planned_text)
+
+    with torch.no_grad():
+        normal_idx = torch.tensor(encode(normal_text), device=device).unsqueeze(0)
+        planned_idx = torch.tensor(encode(planned_text), device=device).unsqueeze(0)
+
+        normal_visible = visible_prefix_action(normal_idx)
+        planned_visible = visible_prefix_action(planned_idx)
+
+        normal_z = model.predict_future_latents(normal_visible)
+        planned_z = model.predict_future_latents(planned_visible)
+
+        normal_hshift = horizon_shift_distance(normal_z)
+        planned_hshift = horizon_shift_distance(planned_z)
+
+        normal_z_final = F.normalize(normal_z[:, -1, :], dim=-1)
+        planned_z_final = F.normalize(planned_z[:, -1, :], dim=-1)
+
+        novelty = 1.0 - (normal_z_final @ planned_z_final.T).item()
+
+    print("\n----- normal vs planned -----")
+    print(
+        "mode     | nll    | deg    | repeat | unique | novelty | hshift"
+    )
+    print(
+        f"normal   | {normal_nll:.3f} | {normal_deg:.3f} | {ns['repeat_rate']:.3f} | {ns['unique_ratio']:.3f} | -       | {normal_hshift:.3f}"
+    )
+    print(
+        f"planned  | {planned_nll:.3f} | {planned_deg:.3f} | {ps['repeat_rate']:.3f} | {ps['unique_ratio']:.3f} | {novelty:.3f} | {planned_hshift:.3f}"
+    )
+    print("------------------------------\n")
+
+    model.train()
+    return {
+        "normal": {"nll": normal_nll, "deg": normal_deg, "repeat_rate": ns["repeat_rate"], "unique_ratio": ns["unique_ratio"], "hshift": normal_hshift},
+        "planned": {"nll": planned_nll, "deg": planned_deg, "repeat_rate": ps["repeat_rate"], "unique_ratio": ps["unique_ratio"], "novelty": novelty, "hshift": planned_hshift},
+    }
 
 
 def text_degeneracy_penalty(token_ids):
@@ -1709,6 +1829,9 @@ def world_model_diagnostics(student, teacher, split="val", batches=10):
 
     per_horizon_true_jepas = {h: [] for h in config["future_horizons"]}
     per_horizon_shuffled_jepas = {h: [] for h in config["future_horizons"]}
+    ablation_action_losses = []
+    ablation_context_losses = []
+    horizon_adjacent_coss = []
 
     for _ in range(max(1, batches)):
         batch = get_world_batch(split)
@@ -1775,6 +1898,35 @@ def world_model_diagnostics(student, teacher, split="val", batches=10):
 
         horizon_cos_dists.append(horizon_cosine_distances(z_pred))
 
+        h_adj = horizon_cosine_distances_per_adjacent(z_pred)
+        horizon_adjacent_coss.append(h_adj)
+
+        b_idx = 0
+        prefix_b = batch["prefix"][b_idx:b_idx+1]
+        action_b = batch["action"][b_idx:b_idx+1]
+        true_future_b = z_teacher[b_idx:b_idx+1]
+        rand_action = torch.randint(0, vocab_size, (1, action_b.size(1)), device=device)
+        rand_prefix = torch.randint(0, vocab_size, (1, prefix_b.size(1)), device=device)
+
+        pred_A = student.predict_future_latents(torch.cat([prefix_b, action_b], dim=1))
+        loss_A = jepa_prediction_loss(pred_A, true_future_b).item()
+
+        pred_B = student.predict_future_latents(torch.cat([prefix_b, rand_action], dim=1))
+        loss_B = jepa_prediction_loss(pred_B, true_future_b).item()
+
+        pred_C = student.predict_future_latents(torch.cat([rand_prefix, action_b], dim=1))
+        loss_C = jepa_prediction_loss(pred_C, true_future_b).item()
+
+        if z_teacher.size(0) > 1:
+            sf_ix = torch.randperm(z_teacher.size(0), device=z_teacher.device)
+            shuffled_future_b = z_teacher[sf_ix][b_idx:b_idx+1]
+        else:
+            shuffled_future_b = true_future_b
+
+        loss_D = jepa_prediction_loss(pred_A, shuffled_future_b).item()
+
+        ablation_action_losses.append({"A": loss_A, "B": loss_B, "C": loss_C, "D": loss_D})
+
     if student_was_training:
         student.train()
     if teacher_was_training:
@@ -1793,6 +1945,15 @@ def world_model_diagnostics(student, teacher, split="val", batches=10):
             "match_gap": sj - tj,
         }
 
+    avg_A = sum(x["A"] for x in ablation_action_losses) / len(ablation_action_losses)
+    avg_B = sum(x["B"] for x in ablation_action_losses) / len(ablation_action_losses)
+    avg_C = sum(x["C"] for x in ablation_action_losses) / len(ablation_action_losses)
+    avg_D = sum(x["D"] for x in ablation_action_losses) / len(ablation_action_losses)
+
+    horizon_adj_results = {}
+    for key in ["cos_8_16", "dist_8_16", "cos_16_32", "dist_16_32", "cos_32_64", "dist_32_64"]:
+        horizon_adj_results[key] = sum(d[key] for d in horizon_adjacent_coss) / len(horizon_adjacent_coss)
+
     return {
         "true_jepa": true_jepa,
         "shuffled_future_jepa": shuffled_future_jepa,
@@ -1804,6 +1965,10 @@ def world_model_diagnostics(student, teacher, split="val", batches=10):
         "candidate_cos_max": max(cand_cos_maxs),
         "horizon_cos_dist": sum(horizon_cos_dists) / len(horizon_cos_dists),
         "per_horizon": per_horizon_results,
+        "ablation_action_gap": avg_B - avg_A,
+        "ablation_context_gap": avg_C - avg_A,
+        "ablation_future_shuffle_gap": avg_D - avg_A,
+        "horizon_adjacent": horizon_adj_results,
     }
 
 
@@ -1959,6 +2124,19 @@ def print_world_diagnostics(diagnostics):
         print(
             f"h{h:4d}   | {ph['true_jepa']:.4f}    | {ph['shuffled_jepa']:.4f}       | {ph['match_gap']:.4f}"
         )
+    print("Horizon adjacent cosine distances:")
+    ha = diagnostics["horizon_adjacent"]
+    print(
+        f"cos_8_16={ha['cos_8_16']:.4f} dist_8_16={ha['dist_8_16']:.4f}  "
+        f"cos_16_32={ha['cos_16_32']:.4f} dist_16_32={ha['dist_16_32']:.4f}  "
+        f"cos_32_64={ha['cos_32_64']:.4f} dist_32_64={ha['dist_32_64']:.4f}"
+    )
+    print("Ablation gaps:")
+    print(
+        f"action_ablation_gap={diagnostics['ablation_action_gap']:.4f}  "
+        f"context_ablation_gap={diagnostics['ablation_context_gap']:.4f}  "
+        f"future_shuffle_gap={diagnostics['ablation_future_shuffle_gap']:.4f}"
+    )
     print("")
 
 
@@ -2117,6 +2295,13 @@ for step in range(1, config["max_steps"] + 1):
             candidates=config["rank_candidates"],
             temperature=config["planned_temperature"],
             top_k_val=config["planned_top_k"],
+        )
+        compare_normal_vs_planned(
+            student,
+            prefix=config["planned_generation_prefix"],
+            total_tokens=config["planned_sample_tokens"],
+            action_tokens=config["planned_action_tokens"],
+            candidates=config["planned_candidates"],
         )
         print_world_diagnostics(diagnostics)
 
