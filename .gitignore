@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 
 checkpoints/
+checkpoints_direct_ternary/
 *.pt
 *.pth
 training_logs/
