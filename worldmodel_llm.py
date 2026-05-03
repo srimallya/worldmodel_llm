@@ -75,7 +75,7 @@ config = dict(
     future_horizons=(8, 16, 32, 64),
 
     # training
-    max_steps=50000,
+    max_steps=24000,
     eval_interval=200,
     learning_rate=3e-4,
     weight_decay=0.01,
@@ -1158,25 +1158,16 @@ def rerank_generate_nll_only(
     return decode(idx[0].tolist())
 
 
-def compare_generation_modes(model, prefix, total_tokens=400, action_tokens=32, candidates=8):
+def _run_generation_modes_for_prefix(model, prefix, total_tokens=400, action_tokens=32, candidates=8):
     """
-    Compare three generation modes from the same prefix:
-    1. normal sampling (single-pass)
-    2. nll-only reranking
-    3. latent-planned reranking (full planned_generate)
-
-    Prints table: mode | nll | deg | repeat | unique | novelty | hshift | world_score_proxy
-
-    Also prints latent_planning_advantage = nll_only_score - planned_score.
+    Core logic: generate all 3 modes for one prefix and return metrics.
+    No printing. Returns dict with metrics for normal, nll_rerank, planned.
     """
     model.eval()
-
     prefix_len = len(encode(prefix))
 
-    # ---- Mode 1: Normal sampling ----
     normal_text = sample_text(model, prefix=prefix, steps=total_tokens, return_text=True)
 
-    # ---- Mode 2: NLL reranking only ----
     nll_text = rerank_generate_nll_only(
         model,
         prefix=prefix,
@@ -1187,7 +1178,6 @@ def compare_generation_modes(model, prefix, total_tokens=400, action_tokens=32, 
         top_k_val=config["planned_top_k"],
     )
 
-    # ---- Mode 3: Latent-planned reranking ----
     planned_text = planned_generate(
         model,
         prefix=prefix,
@@ -1203,10 +1193,7 @@ def compare_generation_modes(model, prefix, total_tokens=400, action_tokens=32, 
 
     def _text_stats(s):
         repeats = sum(1 for i in range(1, len(s)) if s[i] == s[i - 1])
-        return {
-            "repeat_rate": repeats / max(1, len(s)),
-            "unique_ratio": len(set(s)) / max(1, len(s)),
-        }
+        return {"repeat_rate": repeats / max(1, len(s)), "unique_ratio": len(set(s)) / max(1, len(s))}
 
     def _eval_mode(text):
         ids = encode(text)
@@ -1214,74 +1201,130 @@ def compare_generation_modes(model, prefix, total_tokens=400, action_tokens=32, 
         nll = continuation_nll(model, token_ids, prefix_len)
         deg = text_degeneracy_penalty(token_ids[0])
         stats = _text_stats(text)
-
         with torch.no_grad():
             visible = visible_prefix_action(token_ids)
             z_pred = model.predict_future_latents(visible)
             hshift = horizon_shift_distance(z_pred)
-            z_final = z_pred[:, -1, :]
-            z_norm_val = float(z_final.norm(dim=-1).mean().detach().cpu())
-
+            z_norm_val = float(z_pred[:, -1, :].norm(dim=-1).mean().detach().cpu())
         return {
-            "nll": nll,
-            "deg": deg,
-            "repeat_rate": stats["repeat_rate"],
-            "unique_ratio": stats["unique_ratio"],
-            "hshift": hshift,
-            "z_norm": z_norm_val,
+            "nll": nll, "deg": deg, "repeat_rate": stats["repeat_rate"],
+            "unique_ratio": stats["unique_ratio"], "hshift": hshift, "z_norm": z_norm_val,
         }
 
     normal = _eval_mode(normal_text)
     nll_rerank = _eval_mode(nll_text)
     planned = _eval_mode(planned_text)
 
-    # world_score_proxy = lower is better (weighted composite)
     for m in (normal, nll_rerank, planned):
         m["world_score_proxy"] = (
-            m["nll"]
-            + 2.0 * m["deg"]
-            + 0.5 * m["hshift"]
-            + 0.1 * max(0.0, 10.0 - m["z_norm"])  # penalise collapsed/weak latents
+            m["nll"] + 2.0 * m["deg"] + 0.5 * m["hshift"]
+            + 0.1 * max(0.0, 10.0 - m["z_norm"])
         )
+
+    with torch.no_grad():
+        nll_tok = torch.tensor(encode(nll_text), device=device).unsqueeze(0)
+        plan_tok = torch.tensor(encode(planned_text), device=device).unsqueeze(0)
+        nll_z = model.predict_future_latents(visible_prefix_action(nll_tok))[:, -1, :]
+        plan_z = model.predict_future_latents(visible_prefix_action(plan_tok))[:, -1, :]
+        novelty = 1.0 - (F.normalize(nll_z, dim=-1) @ F.normalize(plan_z, dim=-1).T).item()
 
     latent_planning_advantage = nll_rerank["world_score_proxy"] - planned["world_score_proxy"]
 
-    # relative novelty between planned and reranked (how different their latents are)
-    with torch.no_grad():
-        nll_ids = encode(nll_text)
-        plan_ids = encode(planned_text)
-        nll_tok = torch.tensor(nll_ids, device=device).unsqueeze(0)
-        plan_tok = torch.tensor(plan_ids, device=device).unsqueeze(0)
-        nll_vis = visible_prefix_action(nll_tok)
-        plan_vis = visible_prefix_action(plan_tok)
-        nll_z = model.predict_future_latents(nll_vis)[:, -1, :]
-        plan_z = model.predict_future_latents(plan_vis)[:, -1, :]
-        novelty = 1.0 - (F.normalize(nll_z, dim=-1) @ F.normalize(plan_z, dim=-1).T).item()
-
-    print("\n----- generation mode comparison -----")
-    print(
-        f"{'mode':>12} | {'nll':>6} | {'deg':>5} | {'repeat':>6} | {'unique':>6} | {'novelty':>7} | {'hshift':>6} | {'w_proxy':>7}"
-    )
-    print(
-        f"{'normal':>12} | {normal['nll']:>6.3f} | {normal['deg']:>5.3f} | {normal['repeat_rate']:>6.3f} | {normal['unique_ratio']:>6.3f} | {'-':>7} | {normal['hshift']:>6.3f} | {normal['world_score_proxy']:>7.3f}"
-    )
-    print(
-        f"{'nll_rerank':>12} | {nll_rerank['nll']:>6.3f} | {nll_rerank['deg']:>5.3f} | {nll_rerank['repeat_rate']:>6.3f} | {nll_rerank['unique_ratio']:>6.3f} | {novelty:>7.3f} | {nll_rerank['hshift']:>6.3f} | {nll_rerank['world_score_proxy']:>7.3f}"
-    )
-    print(
-        f"{'planned':>12} | {planned['nll']:>6.3f} | {planned['deg']:>5.3f} | {planned['repeat_rate']:>6.3f} | {planned['unique_ratio']:>6.3f} | {novelty:>7.3f} | {planned['hshift']:>6.3f} | {planned['world_score_proxy']:>7.3f}"
-    )
-    print(f"\nlatent_planning_advantage = {latent_planning_advantage:.4f}")
-    print("  (positive means planned is better than NLL reranking)")
-    print("--------------------------------------\n")
-
-    model.train()
     return {
         "normal": normal,
         "nll_rerank": nll_rerank,
         "planned": planned,
         "latent_planning_advantage": latent_planning_advantage,
         "nll_planned_novelty": novelty,
+    }
+
+
+def compare_generation_modes(model, prefix, total_tokens=400, action_tokens=32, candidates=8):
+    """
+    Single-prefix comparison. Prints table and returns metrics.
+    """
+    result = _run_generation_modes_for_prefix(model, prefix, total_tokens, action_tokens, candidates)
+    normal = result["normal"]
+    nll_rerank = result["nll_rerank"]
+    planned = result["planned"]
+    novelty = result["nll_planned_novelty"]
+    lpa = result["latent_planning_advantage"]
+
+    print("\n----- generation mode comparison -----")
+    print(f"{'mode':>12} | {'nll':>6} | {'deg':>5} | {'repeat':>6} | {'unique':>6} | {'novelty':>7} | {'hshift':>6} | {'w_proxy':>7}")
+    print(f"{'normal':>12} | {normal['nll']:>6.3f} | {normal['deg']:>5.3f} | {normal['repeat_rate']:>6.3f} | {normal['unique_ratio']:>6.3f} | {'-':>7} | {normal['hshift']:>6.3f} | {normal['world_score_proxy']:>7.3f}")
+    print(f"{'nll_rerank':>12} | {nll_rerank['nll']:>6.3f} | {nll_rerank['deg']:>5.3f} | {nll_rerank['repeat_rate']:>6.3f} | {nll_rerank['unique_ratio']:>6.3f} | {novelty:>7.3f} | {nll_rerank['hshift']:>6.3f} | {nll_rerank['world_score_proxy']:>7.3f}")
+    print(f"{'planned':>12} | {planned['nll']:>6.3f} | {planned['deg']:>5.3f} | {planned['repeat_rate']:>6.3f} | {planned['unique_ratio']:>6.3f} | {novelty:>7.3f} | {planned['hshift']:>6.3f} | {planned['world_score_proxy']:>7.3f}")
+    print(f"\nlatent_planning_advantage = {lpa:.4f}")
+    print("  (positive means planned is better than NLL reranking)")
+    print("--------------------------------------\n")
+
+    return result
+
+
+def compare_generation_modes_multi_prefix(model, num_prefixes=20, total_tokens=400, action_tokens=32, candidates=8):
+    """
+    Averaged comparison over N random validation prefixes.
+    Reports mean ± std for all metrics.
+    """
+    model.eval()
+
+    prefix_chars = config["planning_prefix_chars"]
+    results_by_mode = {"normal": [], "nll_rerank": [], "planned": []}
+    lpas = []
+    novelties = []
+
+    for _ in range(num_prefixes):
+        if len(val_data) > prefix_chars + 1:
+            start = torch.randint(0, len(val_data) - prefix_chars - 1, (1,)).item()
+            prefix = decode(val_data[start:start + prefix_chars].tolist())
+        else:
+            prefix = decode(train_data[:prefix_chars].tolist())
+
+        r = _run_generation_modes_for_prefix(model, prefix, total_tokens, action_tokens, candidates)
+        for mode in ("normal", "nll_rerank", "planned"):
+            results_by_mode[mode].append(r[mode])
+        lpas.append(r["latent_planning_advantage"])
+        novelties.append(r["nll_planned_novelty"])
+
+    def _mean_std(values):
+        if not values:
+            return 0.0, 0.0
+        t = torch.tensor(values, dtype=torch.float32)
+        return float(t.mean()), float(t.std(unbiased=False))
+
+    def _agg(metrics_list, key):
+        return _mean_std([m[key] for m in metrics_list])
+
+    print(f"\n===== generation modes over {num_prefixes} val prefixes =====")
+    print(f"{'mode':>12} | {'nll':>10} | {'deg':>10} | {'repeat':>10} | {'unique':>10} | {'hshift':>10} | {'w_proxy':>10}")
+    print(f"{'':12} | {'mean±std':>10} | {'mean±std':>10} | {'mean±std':>10} | {'mean±std':>10} | {'mean±std':>10} | {'mean±std':>10}")
+    for mode in ("normal", "nll_rerank", "planned"):
+        nll_m, nll_s = _agg(results_by_mode[mode], "nll")
+        deg_m, deg_s = _agg(results_by_mode[mode], "deg")
+        rep_m, rep_s = _agg(results_by_mode[mode], "repeat_rate")
+        uni_m, uni_s = _agg(results_by_mode[mode], "unique_ratio")
+        hsh_m, hsh_s = _agg(results_by_mode[mode], "hshift")
+        wpx_m, wpx_s = _agg(results_by_mode[mode], "world_score_proxy")
+        print(f"{mode:>12} | {nll_m:.3f}±{nll_s:.3f} | {deg_m:.3f}±{deg_s:.3f} | {rep_m:.3f}±{rep_s:.3f} | {uni_m:.3f}±{uni_s:.3f} | {hsh_m:.3f}±{hsh_s:.3f} | {wpx_m:.3f}±{wpx_s:.3f}")
+
+    lpa_m, lpa_s = _mean_std(lpas)
+    nov_m, nov_s = _mean_std(novelties)
+    print(f"\nlatent_planning_advantage = {lpa_m:.4f} ± {lpa_s:.4f}")
+    print(f"nll_planned_novelty       = {nov_m:.4f} ± {nov_s:.4f}")
+    print("  (positive advantage means planned beats NLL reranking on average)")
+    print("======================================================\n")
+
+    model.train()
+    return {
+        "num_prefixes": num_prefixes,
+        "normal": results_by_mode["normal"],
+        "nll_rerank": results_by_mode["nll_rerank"],
+        "planned": results_by_mode["planned"],
+        "latent_planning_advantage_mean": lpa_m,
+        "latent_planning_advantage_std": lpa_s,
+        "nll_planned_novelty_mean": nov_m,
+        "nll_planned_novelty_std": nov_s,
     }
 
 
@@ -2396,9 +2439,9 @@ for step in range(1, config["max_steps"] + 1):
             temperature=config["planned_temperature"],
             top_k_val=config["planned_top_k"],
         )
-        compare_generation_modes(
+        compare_generation_modes_multi_prefix(
             student,
-            prefix=config["planned_generation_prefix"],
+            num_prefixes=20,
             total_tokens=config["planned_sample_tokens"],
             action_tokens=config["planned_action_tokens"],
             candidates=config["planned_candidates"],
