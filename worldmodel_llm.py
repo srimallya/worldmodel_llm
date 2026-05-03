@@ -1090,7 +1090,7 @@ def visible_prefix_action(tokens):
 
 def compute_generation_metrics(model, text, prefix_len=0):
     ids = encode(text)
-    token_ids = torch.tensor(ids, device=device).unsqueeze(0)
+    token_ids = ids.to(device).unsqueeze(0)
 
     nll = continuation_nll(model, token_ids, prefix_len) if prefix_len > 0 else 0.0
     deg = text_degeneracy_penalty(token_ids[0])
@@ -1197,7 +1197,7 @@ def _run_generation_modes_for_prefix(model, prefix, total_tokens=400, action_tok
 
     def _eval_mode(text):
         ids = encode(text)
-        token_ids = torch.tensor(ids, device=device).unsqueeze(0)
+        token_ids = ids.to(device).unsqueeze(0)
         nll = continuation_nll(model, token_ids, prefix_len)
         deg = text_degeneracy_penalty(token_ids[0])
         stats = _text_stats(text)
@@ -1222,8 +1222,8 @@ def _run_generation_modes_for_prefix(model, prefix, total_tokens=400, action_tok
         )
 
     with torch.no_grad():
-        nll_tok = torch.tensor(encode(nll_text), device=device).unsqueeze(0)
-        plan_tok = torch.tensor(encode(planned_text), device=device).unsqueeze(0)
+        nll_tok = encode(nll_text).to(device).unsqueeze(0)
+        plan_tok = encode(planned_text).to(device).unsqueeze(0)
         nll_z = model.predict_future_latents(visible_prefix_action(nll_tok))[:, -1, :]
         plan_z = model.predict_future_latents(visible_prefix_action(plan_tok))[:, -1, :]
         novelty = 1.0 - (F.normalize(nll_z, dim=-1) @ F.normalize(plan_z, dim=-1).T).item()
